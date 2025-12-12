@@ -1,0 +1,816 @@
+<?php
+declare(strict_types=1);
+/**
+ * Last.php — PRE-MATCH MAX + MMM + Ghost + PF (Merged All-In-One)
+ * - Single-file deploy (PHP 7.4+). Uses SQLite (pdo_sqlite)
+ * - Features: Pre-Match MAX (decon/BID/OPP/PMI/EDM) + MMM + Ghost Layer + Probability Fusion
+ * - Endpoints: master_analyze (POST), mark_outcome (POST), ewma_stats, match_cases
+ *
+ * WARNING: Backup original Last.php and DB before deploying
+ */
+
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
+error_reporting(E_ALL);
+date_default_timezone_set('Asia/Bangkok');
+
+$BASEDIR = __DIR__;
+$DB_FILE = $BASEDIR . '/last_allin.db';
+
+// ---------------- DB init ----------------
+$pdo = null;
+try {
+    $pdo = new PDO('sqlite:' . $DB_FILE);
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+    // core tables
+    $pdo->exec("CREATE TABLE IF NOT EXISTS ewma_store (k TEXT PRIMARY KEY, v REAL, alpha REAL, updated_at INTEGER)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS samples (id INTEGER PRIMARY KEY AUTOINCREMENT, k TEXT, sample REAL, ts INTEGER)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS match_cases (id INTEGER PRIMARY KEY AUTOINCREMENT, match_key TEXT, kickoff_ts INTEGER, league TEXT, payload TEXT, analysis TEXT, outcome TEXT, ts INTEGER)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS pattern_memory (id INTEGER PRIMARY KEY AUTOINCREMENT, signature TEXT, count INTEGER, win_rate REAL, last_seen INTEGER, meta TEXT)");
+
+    // PM-MAX & learning
+    $pdo->exec("CREATE TABLE IF NOT EXISTS pm_integrity (id INTEGER PRIMARY KEY AUTOINCREMENT, match_key TEXT, issues TEXT, score REAL, ts INTEGER)");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS autotune_log (id INTEGER PRIMARY KEY AUTOINCREMENT, param TEXT, old REAL, new REAL, reason TEXT, ts INTEGER)");
+
+    // MMM: market memory store
+    $pdo->exec("CREATE TABLE IF NOT EXISTS market_memory (id INTEGER PRIMARY KEY AUTOINCREMENT, signature TEXT, home TEXT, away TEXT, open_json TEXT, now_json TEXT, ah_json TEXT, features_json TEXT, result TEXT, count INTEGER, win_rate REAL, last_seen INTEGER)");
+    // Ghost events
+    $pdo->exec("CREATE TABLE IF NOT EXISTS ghost_events (id INTEGER PRIMARY KEY AUTOINCREMENT, match_key TEXT, kickoff_ts INTEGER, maxRel REAL, ghost_strength REAL, chaos REAL, direction TEXT, ts INTEGER)");
+} catch (Exception $e) {
+    error_log("DB init error: " . $e->getMessage());
+    $pdo = null;
+}
+
+// ---------------- CONFIG ----------------
+$CONFIG = [
+    'mode'=>'pre_match',
+    'mpe_sim_count'=>800,
+    'tpo_margin_est'=>0.06,
+    'reboundSens_min'=>0.02,
+    'mem_eq_shift_threshold'=>0.03,
+    'autotune_enabled'=>true,
+    'autotune_min_cases'=>30,
+    'autotune_alpha_step'=>0.01,
+    'void_divergence_threshold'=>0.08,
+    'void_overload_threshold'=>0.55,
+    'void_lock_layers_required'=>3,
+    // PRE-MATCH MAX parameters
+    'pm_max_overround_cut'=>0.12,
+    'pm_early_drop_threshold'=>0.08,
+    'pm_deception_score_cut'=>0.42,
+    'pm_opp_resolution'=>1000,
+    // MMM params
+    'mmm_similarity_cutoff'=>0.15, // lower = stricter
+    'mmm_min_matches'=>3,
+    // PF weights (tunable)
+    'pf_weights'=>[
+        'to_gap'=>0.18,
+        'netflow'=>0.14,
+        'fakeflow'=>0.10,
+        'smk'=>0.20,
+        'divergence'=>0.10,
+        'mmm_match'=>0.14,
+        'ghost'=>0.06,
+        'ewma'=>0.08
+    ]
+];
+
+// ---------------- Helpers ----------------
+function safeFloat($v){ if(!isset($v)) return NAN; $s=trim((string)$v); if($s==='') return NAN; $s=str_replace([',',' '],['.',''],$s); return is_numeric($s)? floatval($s) : NAN; }
+function clampf($v,$a,$b){ return max($a,min($b,$v)); }
+function nf($v,$d=4){ return (is_nan($v) || $v===null) ? '-' : number_format((float)$v,$d,'.',''); }
+function netflow($open,$now){ if(is_nan($open)||is_nan($now)) return NAN; return $open - $now; }
+function mom_abs($open,$now){ $n=netflow($open,$now); return is_nan($n)?NAN:abs($n); }
+function dir_label($open,$now){ if(is_nan($open)||is_nan($now)) return 'flat'; if($now<$open) return 'down'; if($now>$open) return 'up'; return 'flat'; }
+function now_ts(){ return time(); }
+
+// ---------------- EWMA ----------------
+function ewma_get(string $k, float $fallback=0.0, float $default_alpha=0.08){
+    global $pdo, $CONFIG;
+    if (!$pdo) return ['v'=>$fallback,'alpha'=>$default_alpha];
+    $st = $pdo->prepare("SELECT v,alpha FROM ewma_store WHERE k=:k");
+    $st->execute([':k'=>$k]);
+    $r = $st->fetch(PDO::FETCH_ASSOC);
+    if ($r===false) {
+        $alpha = $default_alpha;
+        $ins = $pdo->prepare("INSERT OR REPLACE INTO ewma_store (k,v,alpha,updated_at) VALUES(:k,:v,:a,:t)");
+        $ins->execute([':k'=>$k,':v'=>$fallback,':a'=>$alpha,':t'=>now_ts()]);
+        return ['v'=>$fallback,'alpha'=>$alpha];
+    }
+    return ['v'=>floatval($r['v']),'alpha'=>floatval($r['alpha'])];
+}
+function ewma_update(string $k, float $sample){
+    global $pdo;
+    if (!$pdo) return null;
+    $cur = ewma_get($k);
+    $alpha = floatval($cur['alpha'] ?? 0.08);
+    $newv = ($alpha * $sample) + ((1.0 - $alpha) * floatval($cur['v']));
+    $st = $pdo->prepare("INSERT OR REPLACE INTO ewma_store (k,v,alpha,updated_at) VALUES(:k,:v,:a,:t)");
+    $st->execute([':k'=>$k,':v'=>$newv,':a'=>$alpha,':t'=>now_ts()]);
+    $st2 = $pdo->prepare("INSERT INTO samples (k,sample,ts) VALUES(:k,:s,:t)");
+    $st2->execute([':k'=>$k,':s'=>$sample,':t'=>now_ts()]);
+    return ['k'=>$k,'v'=>$newv,'alpha'=>$alpha];
+}
+
+// ---------------- Poisson ----------------
+function poisson_rand($lambda){ $L = exp(-$lambda); $k = 0; $p = 1.0; do { $k++; $p *= mt_rand()/mt_getrandmax(); } while ($p > $L); return $k - 1; }
+
+// ---------------- TPO / MPE / PM-DE / MME / UDS / SMK-X / PCE etc. ----------------
+// (Reuse prior implementations — kept compact)
+
+function tpo_estimate(array $now1){
+    global $CONFIG;
+    $imp=[]; $sum=0;
+    foreach(['home','draw','away'] as $k){
+        $o = safeFloat($now1[$k] ?? null);
+        $p = (is_nan($o) || $o<=0) ? 0.0 : (1.0/$o);
+        $imp[$k]=$p; $sum += $p;
+    }
+    if ($sum<=0) return ['tpo'=>['home'=>0.33,'draw'=>0.34,'away'=>0.33],'overround'=>0.0];
+    foreach(['home','draw','away'] as $k) $imp[$k]/=$sum;
+    $overround = $sum - 1.0;
+    $est_margin = $overround>0 ? $overround : $CONFIG['tpo_margin_est'];
+    $tpo=[]; $sumt=0;
+    foreach(['home','draw','away'] as $k){
+        $raw = $imp[$k] / (1.0 + $est_margin);
+        $tpo[$k] = max(1e-6,$raw);
+        $sumt += $tpo[$k];
+    }
+    foreach(['home','draw','away'] as $k) $tpo[$k] /= max(1e-9,$sumt);
+    return ['tpo'=>$tpo,'overround'=>$overround];
+}
+
+function mpe_simulate(array $tpo, int $sim_count=800) {
+    $ph = max(1e-6,$tpo['home']); $pa = max(1e-6,$tpo['away']);
+    $strength = log($ph / $pa + 1e-9);
+    $base = 1.15;
+    $home_xg = max(0.15,$base + ($strength * 0.45));
+    $away_xg = max(0.15,$base - ($strength * 0.45));
+    $counts=['home'=>0,'draw'=>0,'away'=>0];
+    $sim = max(300, min(3000, $sim_count));
+    for ($i=0;$i<$sim;$i++){
+        $h=poisson_rand($home_xg); $a=poisson_rand($away_xg);
+        if ($h>$a) $counts['home']++; elseif ($a>$h) $counts['away']++; else $counts['draw']++;
+    }
+    return ['home'=>$counts['home']/$sim,'draw'=>$counts['draw']/$sim,'away'=>$counts['away']/$sim,'home_xg'=>$home_xg,'away_xg'=>$away_xg];
+}
+
+function pm_disparity(array $open1, array $now1){
+    $io=[];$in=[];$sumo=0;$sumn=0;
+    foreach(['home','draw','away'] as $k){
+        $o=safeFloat($open1[$k] ?? null); $n=safeFloat($now1[$k] ?? null);
+        $io[$k]=(is_nan($o)||$o<=0)?0.0:1.0/$o; $sumo += $io[$k];
+        $in[$k]=(is_nan($n)||$n<=0)?0.0:1.0/$n; $sumn += $in[$k];
+    }
+    if ($sumo>0) foreach(['home','draw','away'] as $k) $io[$k]/=$sumo;
+    if ($sumn>0) foreach(['home','draw','away'] as $k) $in[$k]/=$sumn;
+    $details=[]; $mag=0;
+    foreach(['home','draw','away'] as $k){ $d = $in[$k]-$io[$k]; $details[$k]=$d; $mag += abs($d); }
+    return ['disparity'=>$mag,'details'=>$details];
+}
+
+function mme_analyze(array $ah_details, array $flow1, ?int $kickoff_ts=null){
+    $juice=0.0; foreach ($ah_details as $ad){ $hj = (!is_nan($ad['open_home']) && !is_nan($ad['now_home'])) ? abs($ad['open_home']-$ad['now_home']) : 0.0; $aj = (!is_nan($ad['open_away']) && !is_nan($ad['now_away'])) ? abs($ad['open_away']-$ad['now_away']) : 0.0; $juice += $hj+$aj; }
+    $stackHome=0;$stackAway=0;
+    foreach ($ah_details as $ls) {
+        $hRel = (!is_nan($ls['open_home']) && $ls['open_home']>0) ? (($ls['now_home']-$ls['open_home'])/$ls['open_home']) : 0;
+        $aRel = (!is_nan($ls['open_away']) && $ls['open_away']>0) ? (($ls['now_away']-$ls['open_away'])/$ls['open_away']) : 0;
+        if ($hRel<0||$aRel<0) $stackHome++; if ($hRel>0||$aRel>0) $stackAway++;
+    }
+    $stackFactor = count($ah_details) ? max($stackHome,$stackAway)/max(1,count($ah_details)) : 0;
+    $hours = 48; if ($kickoff_ts) { $ttk = max(0,$kickoff_ts - time()); $hours = $ttk / 3600.0; }
+    $late_weight = ($hours <= 2) ? 1.5 : (($hours <= 24) ? 1.1 : 0.9);
+    $juiceNorm = clampf($juice * $late_weight, 0.0, 10.0);
+    $isSharp = ($juiceNorm > 0.2 && $stackFactor > 0.4);
+    $isTrap = ($juiceNorm > 0.2 && $stackFactor < 0.25);
+    return ['juice'=>$juice,'juiceNorm'=>$juiceNorm,'stackFactor'=>$stackFactor,'isSharp'=>$isSharp,'isTrap'=>$isTrap,'hours_to_kick'=>$hours];
+}
+
+function uds_detect(array $ah_details, array $flow1){
+    $totalAH=0.0; foreach($ah_details as $ad) $totalAH += (abs($ad['net_home'] ?? 0) + abs($ad['net_away'] ?? 0));
+    $total1x2=0.0; foreach(['home','away'] as $s) $total1x2 += abs($flow1[$s] ?? 0);
+    $divergence = abs($totalAH - $total1x2);
+    $conflict=0;
+    for ($i=0;$i<count($ah_details);$i++){
+        for ($j=$i+1;$j<count($ah_details);$j++){
+            $a=$ah_details[$i]; $b=$ah_details[$j];
+            if (($a['dir_home'] ?? '') !== ($b['dir_home'] ?? '') || ($a['dir_away'] ?? '') !== ($b['dir_away'] ?? '')) $conflict++;
+        }
+    }
+    $pattern = ($conflict>0) ? 'multi_price_conflict' : 'aligned';
+    return ['divergence'=>$divergence,'conflict'=>$conflict,'pattern'=>$pattern];
+}
+
+function smkx_score(array $tpo, array $true_prob, array $mme, array $uds){
+    $gap=0.0; foreach(['home','draw','away'] as $k) $gap += abs(($true_prob[$k] ?? 0) - ($tpo[$k] ?? 0));
+    $gap = clampf($gap,0.0,1.0);
+    $score=0.0; $score += clampf($gap,0,1)*0.35; $score += ($mme['isSharp']?0.3:0.0); $score += ($mme['isTrap']?0.05:0.0); $score += clampf($uds['divergence']/0.5,0.0,0.3);
+    $score = clampf($score,0.0,1.0);
+    $type = $score>=0.7 ? 'smart_money_killer' : ($score>=0.45 ? 'smart_money_possible' : 'no_smk');
+    return ['score'=>$score,'type'=>$type,'components'=>['gap'=>$gap,'mme'=>$mme,'uds'=>$uds]];
+}
+
+function pce_project(array $market_prob, array $tpo, array $mme, array $uds){
+    $proj = $market_prob;
+    $moveFrac = $mme['isSharp'] ? 0.5 : 0.15; if ($mme['isTrap']) $moveFrac = -0.35;
+    foreach(['home','draw','away'] as $k) $proj[$k] = clampf($market_prob[$k] + ($tpo[$k] - $market_prob[$k])*$moveFrac, 0.0001, 0.9999);
+    $s = array_sum($proj); foreach(['home','draw','away'] as $k) $proj[$k] /= max(1e-9,$s);
+    return $proj;
+}
+
+// ---------------- MEM / CROSS-SHADOW / EMOTIONAL / INSIGHT ----------------
+function mem_compute(array $tpo, array $market_prob){
+    global $pdo, $CONFIG;
+    $hist_home = ewma_get('master_tpo_home', $tpo['home'])['v'];
+    $hist_draw = ewma_get('master_tpo_draw', $tpo['draw'])['v'];
+    $hist_away = ewma_get('master_tpo_away', $tpo['away'])['v'];
+    $equilibrium = [
+        'home'=>clampf(0.6*$hist_home + 0.4*$tpo['home'],1e-6,0.9999),
+        'draw'=>clampf(0.6*$hist_draw + 0.4*$tpo['draw'],1e-6,0.9999),
+        'away'=>clampf(0.6*$hist_away + 0.4*$tpo['away'],1e-6,0.9999)
+    ];
+    $s = array_sum($equilibrium); foreach(['home','draw','away'] as $k) $equilibrium[$k]/=max(1e-9,$s);
+    $shift=[]; $maxShift=0;
+    foreach(['home','draw','away'] as $k){ $shift[$k] = ($market_prob[$k] ?? 0) - ($equilibrium[$k] ?? 0); if (abs($shift[$k]) > abs($maxShift)) $maxShift=$shift[$k]; }
+    $label = abs($maxShift) > $CONFIG['mem_eq_shift_threshold'] ? 'shifted' : 'aligned';
+    if ($pdo) {
+        $mk = md5(json_encode($market_prob).microtime(true));
+        $st = $pdo->prepare("INSERT INTO pm_integrity (match_key,issues,score,ts) VALUES(:mk,:iss,:sc,:ts)");
+        $st->execute([':mk'=>$mk,':iss'=>json_encode(['shift'=>$shift]),':sc'=>abs($maxShift),':ts'=>now_ts()]);
+    }
+    return ['equilibrium'=>$equilibrium,'shift'=>$shift,'maxShift'=>$maxShift,'label'=>$label];
+}
+
+function crossmarket_shadow(array $now1, array $ah_details){
+    $overround = 0.0; $sum=0;
+    foreach(['home','draw','away'] as $k){ $o=safeFloat($now1[$k] ?? null); if (!is_nan($o) && $o>0) { $sum += 1.0/$o; } }
+    $overround = $sum - 1.0;
+    $ah_count = count($ah_details);
+    $aligned = 0;
+    foreach ($ah_details as $ad) { if (($ad['dir_home'] ?? '') === 'down' || ($ad['dir_away'] ?? '') === 'up') $aligned++; }
+    $leader_score = clampf((($ah_count>0 ? ($aligned/$ah_count) : 0) * 0.6) + (max(0,0.06 - $overround) * 4.0), 0.0, 1.0);
+    $role = $leader_score > 0.55 ? 'leader' : 'follower';
+    return ['leader_score'=>$leader_score,'role'=>$role,'overround'=>$overround,'aligned_lines'=>$aligned,'total_lines'=>$ah_count];
+}
+
+function emotional_sim(array $open1, array $now1, array $ah_details){
+    $nf_home = abs(netflow(safeFloat($open1['home'] ?? null), safeFloat($now1['home'] ?? null)));
+    $nf_away = abs(netflow(safeFloat($open1['away'] ?? null), safeFloat($now1['away'] ?? null)));
+    $ah_moves = 0; foreach ($ah_details as $ad) { if (!is_nan($ad['mom_home'] ?? NAN) && ($ad['mom_home'] ?? 0) > 0.03) $ah_moves++; if (!is_nan($ad['mom_away'] ?? NAN) && ($ad['mom_away'] ?? 0) > 0.03) $ah_moves++; }
+    $panic = ($nf_home + $nf_away) > 0.25 && $ah_moves > 1;
+    $herd = ($nf_home + $nf_away) > 0.08 && $ah_moves >= 1 && !($panic);
+    $smoke = $ah_moves > 0 && ($nf_home + $nf_away) < 0.02;
+    return ['panic'=>$panic,'herd'=>$herd,'smoke'=>$smoke,'nf_home'=>$nf_home,'nf_away'=>$nf_away,'ah_moves'=>$ah_moves];
+}
+
+function insight_predict(array $features){
+    global $pdo;
+    $sig = md5(json_encode($features));
+    if ($pdo) {
+        $st = $pdo->prepare("SELECT * FROM pattern_memory WHERE signature=:sig");
+        $st->execute([':sig'=>$sig]);
+        $r = $st->fetch(PDO::FETCH_ASSOC);
+        if ($r) {
+            return ['from_pattern'=>true,'win_rate'=>floatval($r['win_rate']),'count'=>intval($r['count']),'signature'=>$sig];
+        }
+    }
+    $score = 0.0;
+    if (!empty($features['smkx_score'])) $score += $features['smkx_score'] * 0.6;
+    if (!empty($features['mem_shift'])) $score += clampf(abs($features['mem_shift']) * 1.2, 0.0, 0.3);
+    if (!empty($features['emotional_panic'])) $score -= 0.2;
+    $wr = clampf(0.5 + ($score*0.5), 0.0, 1.0);
+    return ['from_pattern'=>false,'win_rate'=>$wr,'count'=>0,'signature'=>$sig];
+}
+
+// ---------------- PM-MAX (as before) ----------------
+function prematch_real_odds_decon(array $now1){
+    global $pdo, $CONFIG;
+    $market=[]; $sum=0;
+    foreach(['home','draw','away'] as $k){ $o=safeFloat($now1[$k] ?? null); $market[$k] = (is_nan($o)||$o<=0)?0.0:(1.0/$o); $sum += $market[$k]; }
+    if ($sum<=0) return ['true_prob'=>['home'=>0.33,'draw'=>0.34,'away'=>0.33],'overround'=>0.0,'blend'=>[]];
+    foreach(['home','draw','away'] as $k) $market[$k]/=$sum;
+    $overround = $sum - 1.0;
+    $hidden = clampf($overround * 0.6, 0.0, $CONFIG['pm_max_overround_cut']);
+    $hist_home = ewma_get('pm_hist_home',$market['home'])['v'];
+    $hist_draw = ewma_get('pm_hist_draw',$market['draw'])['v'];
+    $hist_away = ewma_get('pm_hist_away',$market['away'])['v'];
+    $market_weight = clampf(1.0 - $hidden, 0.35, 0.95);
+    $hist_weight = 1.0 - $market_weight;
+    $true = [
+        'home' => clampf($market_weight*$market['home'] + $hist_weight*$hist_home, 1e-6, 0.9999),
+        'draw' => clampf($market_weight*$market['draw'] + $hist_weight*$hist_draw, 1e-6, 0.9999),
+        'away' => clampf($market_weight*$market['away'] + $hist_weight*$hist_away, 1e-6, 0.9999),
+    ];
+    $s = array_sum($true); foreach (['home','draw','away'] as $k) $true[$k]/=max(1e-9,$s);
+    ewma_update('pm_hist_home', $true['home']);
+    ewma_update('pm_hist_draw', $true['draw']);
+    ewma_update('pm_hist_away', $true['away']);
+    return ['true_prob'=>$true,'overround'=>$overround,'hidden'=>$hidden,'blend'=>['market_weight'=>$market_weight,'hist_weight'=>$hist_weight]];
+}
+
+function bookmaker_deception_detector(array $open1, array $now1, array $ah_details){
+    global $CONFIG;
+    $score = 0.0; $reasons=[];
+    $ah_move=0; foreach($ah_details as $ad){ $ah_move += (abs(($ad['open_home'] ?? 0)-($ad['now_home'] ?? 0)) + abs(($ad['open_away'] ?? 0)-($ad['now_away'] ?? 0))); }
+    $x2_move = abs(netflow(safeFloat($open1['home'] ?? null), safeFloat($now1['home'] ?? null))) + abs(netflow(safeFloat($open1['away'] ?? null), safeFloat($now1['away'] ?? null)));
+    if ($ah_move > 0.02 && $x2_move < 0.02) { $score += 0.28; $reasons[]='AH-heavy_x2-stable'; }
+    $conflict=0; for($i=0;$i<count($ah_details);$i++){ for($j=$i+1;$j<count($ah_details);$j++){ $a=$ah_details[$i]; $b=$ah_details[$j]; if (($a['dir_home'] ?? '') !== ($b['dir_home'] ?? '')) $conflict++; } }
+    if ($conflict>0){ $score += clampf($conflict*0.06,0,0.2); $reasons[]='multi-line-conflict'; }
+    $early_drop = 0.0;
+    foreach(['home','away'] as $s){ $o=safeFloat($open1[$s] ?? null); $n=safeFloat($now1[$s] ?? null); if(!is_nan($o)&&!is_nan($n)&&$o>0){ $rel = abs(($n-$o)/$o); if ($rel > $CONFIG['pm_early_drop_threshold']) $early_drop += $rel; } }
+    if ($early_drop > 0){ $score += clampf($early_drop,0,0.25); $reasons[]='early_drop'; }
+    $hist_home = ewma_get('pm_hist_home',0.33)['v']; $hist_away = ewma_get('pm_hist_away',0.33)['v'];
+    $cur_home = (is_nan(safeFloat($now1['home'] ?? null))?0.0:(1.0/safeFloat($now1['home'])));
+    $cur_away = (is_nan(safeFloat($now1['away'] ?? null))?0.0:(1.0/safeFloat($now1['away'])));
+    $asym = abs(($cur_home - $hist_home)) + abs(($cur_away - $hist_away));
+    if ($asym > 0.05){ $score += clampf($asym,0,0.15); $reasons[]='hist_asym'; }
+    $score = clampf($score, 0.0, 1.0);
+    $type = $score >= $CONFIG['pm_deception_score_cut'] ? 'deceptive' : ($score >= 0.25 ? 'suspect' : 'clean');
+    return ['score'=>$score,'type'=>$type,'reasons'=>$reasons,'details'=>['ah_move'=>$ah_move,'x2_move'=>$x2_move,'conflict'=>$conflict,'early_drop'=>$early_drop,'asym'=>$asym]];
+}
+
+function outcome_probability_pulse(array $true_prob, int $resolution=1000){
+    $base = 1.12;
+    $home_seed = max(0.08, $base + ($true_prob['home'] - $true_prob['away'])*1.1);
+    $away_seed = max(0.08, $base + ($true_prob['away'] - $true_prob['home'])*1.1);
+    $counts=['home'=>0,'draw'=>0,'away'=>0];
+    $sim = max(300, min(3000, $resolution));
+    for ($i=0;$i<$sim;$i++){
+        $h = poisson_rand($home_seed); $a = poisson_rand($away_seed);
+        if ($h>$a) $counts['home']++; elseif ($a>$h) $counts['away']++; else $counts['draw']++;
+    }
+    $dist = ['home'=>$counts['home']/$sim,'draw'=>$counts['draw']/$sim,'away'=>$counts['away']/$sim];
+    $ent = 0.0; foreach($dist as $p) if ($p>0) $ent -= $p * log($p);
+    return ['dist'=>$dist,'entropy'=>$ent,'home_seed'=>$home_seed,'away_seed'=>$away_seed,'sim'=>$sim];
+}
+
+// ---------------- PM-MAX Integration Function ----------------
+function prematch_max_analyze(array $open1, array $now1, array $ah_details){
+    $decon = prematch_real_odds_decon($now1);
+    $bid = bookmaker_deception_detector($open1,$now1,$ah_details);
+    $opp = outcome_probability_pulse($decon['true_prob'], intval($GLOBALS['CONFIG']['pm_opp_resolution'] ?? 800));
+    $edm = early_drop_detector($open1,$now1);
+    $pmi = prematch_integrity_check($open1,$now1,$ah_details,$bid,$opp);
+    $prematch_score = ($decon['hidden'] * 0.4) + ($bid['score'] * 0.45) + ((1.0 - $pmi['score']) * 0.15);
+    $prematch_score = clampf($prematch_score,0.0,1.0);
+    $verdict = 'clean';
+    if ($prematch_score >= 0.6) $verdict = 'danger';
+    elseif ($prematch_score >= 0.35) $verdict = 'suspicious';
+    return ['decon'=>$decon,'bid'=>$bid,'opp'=>$opp,'edm'=>$edm,'pmi'=>$pmi,'score'=>$prematch_score,'verdict'=>$verdict];
+}
+
+// ---------------- PM Integrity & EDM (reused) ----------------
+function prematch_integrity_check(array $open1, array $now1, array $ah_details, array $bid, array $opp){
+    global $pdo;
+    $issues=[]; $score = 1.0;
+    if ($bid['score'] > 0.45) { $issues[]='deception_high'; $score -= 0.35; }
+    if ($opp['entropy'] > 1.05) { $issues[]='opp_high_entropy'; $score -= 0.25; }
+    if ($bid['details']['early_drop'] > 0) { $issues[]='early_drop'; $score -= 0.2; }
+    $score = clampf($score, 0.0, 1.0);
+    if ($pdo) {
+        $mk = md5(json_encode($open1).json_encode($now1).microtime(true));
+        $st = $pdo->prepare("INSERT INTO pm_integrity (match_key,issues,score,ts) VALUES(:mk,:iss,:sc,:ts)");
+        $st->execute([':mk'=>$mk,':iss'=>json_encode($issues),':sc'=>$score,':ts'=>now_ts()]);
+    }
+    return ['score'=>$score,'issues'=>$issues];
+}
+function early_drop_detector(array $open1, array $now1){
+    global $CONFIG;
+    $maxRel = 0.0;
+    foreach(['home','away','draw'] as $s){
+        $o = safeFloat($open1[$s] ?? null); $n = safeFloat($now1[$s] ?? null);
+        if (!is_nan($o) && !is_nan($n) && $o>0) { $rel = abs(($n - $o)/$o); if ($rel > $maxRel) $maxRel = $rel; }
+    }
+    $flag = $maxRel >= $CONFIG['pm_early_drop_threshold'];
+    return ['maxRel'=>$maxRel,'flag'=>$flag];
+}
+
+// ---------------- MMM (Market Memory Module) ----------------
+function mmm_signature(array $decon, array $bid, array $ah_details){
+    // Create lightweight signature for matching (not exact MD5 of all data)
+    $s = [
+        'true_home'=>round($decon['true_prob']['home'],3),
+        'true_away'=>round($decon['true_prob']['away'],3),
+        'hidden'=>round($decon['hidden'],3),
+        'bid_score'=>round($bid['score'],3),
+        'ah_count'=>count($ah_details),
+    ];
+    return md5(json_encode($s));
+}
+function mmm_record(string $match_key, string $home, string $away, array $open1, array $now1, array $ah_details, array $features, ?string $result){
+    global $pdo;
+    if (!$pdo) return false;
+    $sig = mmm_signature($features['decon'],$features['bid'],$ah_details);
+    // check existing
+    $st = $pdo->prepare("SELECT * FROM market_memory WHERE signature=:s LIMIT 1");
+    $st->execute([':s'=>$sig]);
+    $r = $st->fetch(PDO::FETCH_ASSOC);
+    $now = now_ts();
+    $features_json = json_encode($features);
+    if ($r) {
+        $count = intval($r['count']) + 1;
+        $prev_wr = floatval($r['win_rate']);
+        $win = ($result === 'home' && $features['true_prob']['home'] > $features['true_prob']['away']) || ($result === 'away' && $features['true_prob']['away'] > $features['true_prob']['home']);
+        $new_wr = (($prev_wr * intval($r['count'])) + ($win?1.0:0.0)) / max(1,$count);
+        $upd = $pdo->prepare("UPDATE market_memory SET count=:c,win_rate=:w,last_seen=:ls,open_json=:o,now_json=:n,ah_json=:a,features_json=:f WHERE id=:id");
+        $upd->execute([':c'=>$count,':w'=>$new_wr,':ls'=>$now,':o'=>json_encode($open1),':n'=>json_encode($now1),':a'=>json_encode($ah_details),':f'=>$features_json,':id'=>$r['id']]);
+    } else {
+        $win = ($result === 'home' && $features['true_prob']['home'] > $features['true_prob']['away']) || ($result === 'away' && $features['true_prob']['away'] > $features['true_prob']['home']);
+        $ins = $pdo->prepare("INSERT INTO market_memory (signature,home,away,open_json,now_json,ah_json,features_json,result,count,win_rate,last_seen) VALUES(:s,:h,:a,:o,:n,:ah,:f,:res,1,:wr,:ls)");
+        $ins->execute([':s'=>$sig,':h'=>$home,':a'=>$away,':o'=>json_encode($open1),':n'=>json_encode($now1),':ah'=>json_encode($ah_details),':f'=>$features_json,':res'=>$result,':wr'=>($win?1.0:0.0),':ls'=>$now]);
+    }
+    return true;
+}
+function mmm_lookup(array $decon, array $bid, array $ah_details){
+    global $pdo, $CONFIG;
+    $sig = mmm_signature($decon,$bid,$ah_details);
+    if (!$pdo) return ['matches'=>0,'win_rate'=>0.0,'avg_count'=>0];
+    // simple exact signature lookup first
+    $st = $pdo->prepare("SELECT count,win_rate FROM market_memory WHERE signature=:s LIMIT 10");
+    $st->execute([':s'=>$sig]);
+    $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+    if ($rows && count($rows)>=1) {
+        $c = array_sum(array_map(function($r){ return intval($r['count']); }, $rows));
+        $wr = array_sum(array_map(function($r){ return floatval($r['win_rate']) * intval($r['count']); }, $rows)) / max(1,$c);
+        return ['matches'=>count($rows),'win_rate'=>$wr,'avg_count'=>($c/count($rows))];
+    }
+    // if no exact match, try similarity: by hidden & bid_score & ah_count ranges
+    $hidden = round($decon['hidden'],3);
+    $bidscore = round($bid['score'],3);
+    $ahcount = count($ah_details);
+    $st2 = $pdo->query("SELECT * FROM market_memory ORDER BY last_seen DESC LIMIT 300");
+    $rows2 = $st2->fetchAll(PDO::FETCH_ASSOC);
+    $matches=0; $wrSum=0; $countSum=0;
+    foreach($rows2 as $r){
+        $f = json_decode($r['features_json'], true);
+        if (!$f) continue;
+        $d_hidden = abs(($f['decon']['hidden'] ?? 0) - $hidden);
+        $d_bid = abs(($f['bid']['score'] ?? 0) - $bidscore);
+        $d_ah = abs((intval($f['ah_count'] ?? 0) - $ahcount));
+        $sim = $d_hidden*0.6 + $d_bid*0.3 + ($d_ah*0.05);
+        if ($sim <= $CONFIG['mmm_similarity_cutoff']) {
+            $matches++;
+            $wrSum += floatval($r['win_rate']) * intval($r['count']);
+            $countSum += intval($r['count']);
+        }
+    }
+    if ($matches==0) return ['matches'=>0,'win_rate'=>0.0,'avg_count'=>0];
+    return ['matches'=>$matches,'win_rate'=>($wrSum/max(1,$countSum)),'avg_count'=>($countSum/$matches)];
+}
+
+// ---------------- Ghost Layer ----------------
+function ghost_layer(array $open1, array $now1, ?int $kickoff_ts=null){
+    global $pdo;
+    // compute max relative move among home/away/draw
+    $maxRel = 0.0;
+    foreach(['home','away','draw'] as $s){
+        $o = safeFloat($open1[$s] ?? null); $n = safeFloat($now1[$s] ?? null);
+        if (!is_nan($o) && !is_nan($n) && $o>0) $maxRel = max($maxRel, abs(($n - $o)/$o));
+    }
+    // ghost strength: relative to open, scaled 0..100
+    $ghost_strength = clampf($maxRel * 400.0, 0, 100); // 0.25 -> 100
+    // chaos: measure how many AH lines moved vs 1x2
+    $chaos = 0.0;
+    // for small systems, we approximate chaos by difference of AH-total vs 1x2 total
+    // caller should compute AH details; here return placeholders
+    $direction = 'neutral'; if ($ghost_strength > 30) { $direction = 'follow'; } elseif ($ghost_strength < 8) { $direction = 'reverse'; }
+    // persist ghost event if kickoff given
+    if ($pdo && $kickoff_ts) {
+        $mk = md5(json_encode($open1).json_encode($now1).microtime(true));
+        $st = $pdo->prepare("INSERT INTO ghost_events (match_key,kickoff_ts,maxRel,ghost_strength,chaos,direction,ts) VALUES(:mk,:k,:mr,:gs,:ch,:dir,:ts)");
+        $st->execute([':mk'=>$mk,':k'=>$kickoff_ts,':mr'=>$maxRel,':gs'=>$ghost_strength,':ch'=>$chaos,':dir'=>$direction,':ts'=>now_ts()]);
+    }
+    return ['maxRel'=>$maxRel,'ghost_strength'=>$ghost_strength,'chaos'=>$chaos,'direction'=>$direction];
+}
+
+// ---------------- Probability Fusion (PF Engine) ----------------
+function probability_fusion(array $features){
+    global $CONFIG;
+    $w = $CONFIG['pf_weights'];
+    // Expected features keys:
+    // to_gap (0..1), netflow (0..1), fakeflow (0..1), smk (0..1), divergence (0..1), mmm_winrate (0..1), ghost (0..1), ewma (0..1)
+    $to_gap = clampf($features['to_gap'] ?? 0.0, 0, 1);
+    $netflow = clampf($features['netflow'] ?? 0.0, 0, 1);
+    $fakeflow = clampf($features['fakeflow'] ?? 0.0, 0, 1);
+    $smk = clampf($features['smk'] ?? 0.0, 0, 1);
+    $div = clampf($features['divergence'] ?? 0.0, 0, 1);
+    $mmm = clampf($features['mmm_winrate'] ?? 0.0, 0, 1);
+    $ghost = clampf($features['ghost'] ?? 0.0, 0, 1);
+    $ewma = clampf($features['ewma'] ?? 0.0, 0, 1);
+
+    $score = 0.0;
+    $score += $to_gap * ($w['to_gap'] ?? 0.18);
+    $score += $netflow * ($w['netflow'] ?? 0.14);
+    $score += (1.0 - $fakeflow) * ($w['fakeflow'] ?? 0.10); // less fakeflow => better
+    $score += $smk * ($w['smk'] ?? 0.20);
+    $score += (1.0 - $div) * ($w['divergence'] ?? 0.10); // lower divergence => more trust
+    $score += $mmm * ($w['mmm_match'] ?? 0.14);
+    $score += $ghost * ($w['ghost'] ?? 0.06);
+    $score += $ewma * ($w['ewma'] ?? 0.08);
+
+    // normalize to 0..1 assuming weights sum <= 1.5; clamp final
+    $score = clampf($score, 0.0, 1.0);
+    // Translate to label
+    $label = 'uncertain';
+    if ($score >= 0.72) $label = 'strong';
+    elseif ($score >= 0.55) $label = 'good';
+    elseif ($score >= 0.40) $label = 'marginal';
+    else $label = 'weak';
+    return ['score'=>$score,'label'=>$label];
+}
+
+// ---------------- MASTER ANALYZE (All integrated) ----------------
+function master_analyze(array $payload){
+    global $pdo, $CONFIG;
+    $home = $payload['home'] ?? 'เหย้า'; $away = $payload['away'] ?? 'เยือน';
+    $league = $payload['league'] ?? 'generic';
+    $kickoff = isset($payload['kickoff']) ? intval(strtotime($payload['kickoff'])) : ($payload['kickoff_ts'] ?? null);
+    $open1 = $payload['open1'] ?? ['home'=>NAN,'draw'=>NAN,'away'=>NAN];
+    $now1  = $payload['now1'] ?? ['home'=>NAN,'draw'=>NAN,'away'=>NAN];
+    $ah_list = $payload['ah'] ?? [];
+
+    // AH details & pairs
+    $pairs=[]; $ah_details=[]; $totalAH_mom=0.0;
+    foreach ($ah_list as $i=>$r){
+        $line = $r['line'] ?? ('AH'.($i+1));
+        $oh = safeFloat($r['open_home'] ?? null); $oa = safeFloat($r['open_away'] ?? null);
+        $nh = safeFloat($r['now_home'] ?? null); $na = safeFloat($r['now_away'] ?? null);
+        $mh = is_nan($oh)||is_nan($nh)?NAN:abs($oh-$nh);
+        $ma = is_nan($oa)||is_nan($na)?NAN:abs($oa-$na);
+        if(!is_nan($mh)) $totalAH_mom += $mh; if(!is_nan($ma)) $totalAH_mom += $ma;
+        $ad = ['index'=>$i,'line'=>$line,'open_home'=>$oh,'open_away'=>$oa,'now_home'=>$nh,'now_away'=>$na,'net_home'=>is_nan($oh)||is_nan($nh)?0.0:$oh-$nh,'net_away'=>is_nan($oa)||is_nan($na)?0.0:$oa-$na,'mom_home'=>$mh,'mom_away'=>$ma,'dir_home'=>dir_label($oh,$nh),'dir_away'=>dir_label($oa,$na)];
+        $ah_details[]=$ad; $pairs[]=['open'=>$oh,'now'=>$nh]; $pairs[]=['open'=>$oa,'now'=>$na];
+    }
+
+    // 1x2 flows and mom
+    $flow1 = ['home'=> netflow(safeFloat($open1['home'] ?? null), safeFloat($now1['home'] ?? null)),'draw'=> netflow(safeFloat($open1['draw'] ?? null), safeFloat($now1['draw'] ?? null)),'away'=> netflow(safeFloat($open1['away'] ?? null), safeFloat($now1['away'] ?? null))];
+    $mom1 = ['home'=> mom_abs(safeFloat($open1['home'] ?? null), safeFloat($now1['home'] ?? null)),'draw'=> mom_abs(safeFloat($open1['draw'] ?? null), safeFloat($now1['draw'] ?? null)),'away'=> mom_abs(safeFloat($open1['away'] ?? null), safeFloat($now1['away'] ?? null))];
+    $total1x2_mom = 0.0; foreach ($mom1 as $v) if(!is_nan($v)) $total1x2_mom += $v;
+    $marketMomentum = $total1x2_mom + $totalAH_mom;
+
+    // rebound
+    $reboundSens = 0.025;
+    foreach ($pairs as $p){ if(isset($p['open']) && isset($p['now']) && $p['open']>0) $reboundSens += abs(($p['now']-$p['open'])/$p['open']) * 0.005; }
+    $reboundSens = clampf($reboundSens, $CONFIG['reboundSens_min'], 0.12);
+
+    // primary TPO & MPE
+    $tpoRes = tpo_estimate($now1); $tpo = $tpoRes['tpo']; $overround = $tpoRes['overround'];
+    $mpe = mpe_simulate($tpo, intval($CONFIG['mpe_sim_count']));
+
+    // legacy modules
+    $mme = mme_analyze($ah_details, $flow1, $kickoff);
+    $uds = uds_detect($ah_details,$flow1);
+
+    // PM-MAX core
+    $pmmax = prematch_max_analyze($open1,$now1,$ah_details);
+
+    // true_prob authoritative from pmmax decon
+    $true_prob = $pmmax['decon']['true_prob'];
+    $market_prob_norm = $pmmax['decon']['true_prob'];
+
+    // smkx & ocm
+    $smkx = smkx_score($tpo,$true_prob,$mme,$uds);
+    $ocm_strength = clampf((($pmmax['score']*100) + ($smkx['score']*40) + ($mme['juiceNorm']*10))/3, 0, 100);
+    $ocm = ['strength'=>$ocm_strength];
+
+    // ckp / kill alert
+    $ckp = ['kill_alert'=>false,'reason'=>[],'direction'=>null,'severity'=>0.0];
+    if ($pmmax['verdict'] === 'danger' || $pmmax['bid']['type']==='deceptive') {
+        $ckp['kill_alert'] = true; $ckp['reason'][] = 'pmmax_deceptive'; $ckp['severity'] = clampf($pmmax['score'],0,1);
+    }
+
+    // void-lite
+    $flow = ['avgRel'=>0,'isSharp'=>($mme['isSharp']),'fake'=>($mme['isTrap'])];
+    $div = 0.0; foreach(['home','draw','away'] as $k) $div += abs((($market_prob_norm[$k] ?? 0) - ($true_prob[$k] ?? 0)));
+    $trap = ['level'=>0,'reasons'=>[]];
+    if ($pmmax['bid']['score'] > 0.4) { $trap['level'] += 2; $trap['reasons'][]='pm_deception'; }
+    if ($mme['isTrap']) { $trap['level'] += 1; $trap['reasons'][]='mme_trap'; }
+    $void_strength = clampf(($pmmax['score']*0.45) + ($smkx['score']*0.25) + (abs($div)/0.5 * 0.3), 0,1);
+
+    // MMM lookup
+    $mmm_res = mmm_lookup($pmmax['decon'],$pmmax['bid'],$ah_details);
+
+    // Ghost layer
+    $ghost = ghost_layer($open1,$now1,$kickoff);
+
+    // PF features assembly
+    $to_gap = 0.0;
+    foreach(['home','away'] as $s) {
+        $o = safeFloat($open1[$s] ?? null); $n = safeFloat($now1[$s] ?? null);
+        if (!is_nan($o) && $o>0 && !is_nan($n)) $to_gap = max($to_gap, abs(($n - $o)/$o));
+    }
+    $fakeflow = ($pmmax['bid']['score'] >= 0.4) ? 1.0 : 0.0;
+    $netflow_score = clampf(abs((($flow1['home'] ?? 0) - ($flow1['away'] ?? 0))) / 1.0, 0.0, 1.0);
+    $ewma_trend = ewma_get('master_voidscore',0.0)['v'];
+    $features_pf = [
+        'to_gap'=>clampf($to_gap,0,1),
+        'netflow'=>$netflow_score,
+        'fakeflow'=>$fakeflow,
+        'smk'=>$smkx['score'],
+        'divergence'=>clampf($div/1.0,0,1),
+        'mmm_winrate'=>clampf($mmm_res['win_rate'] ?? 0.0,0,1),
+        'ghost'=>clampf($ghost['ghost_strength']/100.0,0,1),
+        'ewma'=>clampf($ewma_trend,0,1)
+    ];
+    $pf = probability_fusion($features_pf);
+
+    // Final PF-adjusted decision
+    $predicted = 'ไม่แน่ใจ';
+    if ($true_prob['home'] > $true_prob['away'] && $true_prob['home'] > $true_prob['draw']) $predicted = $home;
+    if ($true_prob['away'] > $true_prob['home'] && $true_prob['away'] > $true_prob['draw']) $predicted = $away;
+
+    // Final label logic (PF prioritized)
+    $final_label = '⚠️ ไม่ชัดเจน'; $recommendation = 'รอ confirm';
+    if ($pf['label'] === 'strong' && !$ckp['kill_alert']) {
+        $final_label = '💠 PF STRONG SIGNAL — พิจารณา (Pre-Match MAX)'; $recommendation = 'พิจารณาตาม — จำกัดความเสี่ยง';
+    } elseif ($ckp['kill_alert'] || $pmmax['verdict'] === 'danger') {
+        $final_label = '❌ PM Integrity FAIL — หลีกเลี่ยง'; $recommendation = 'หลีกเลี่ยง';
+    } elseif ($pf['label'] === 'good') {
+        $final_label = '✅ PF GOOD — สัญญาณน่าเล่น'; $recommendation = 'พิจารณา / small stake';
+    } elseif ($pf['label'] === 'marginal') {
+        $final_label = '⚠️ PF MARGINAL — ระวัง'; $recommendation = 'Watch';
+    } else {
+        $final_label = '⚪ PF WEAK — ไม่แนะนำ'; $recommendation = 'ไม่แนะนำ';
+    }
+
+    $confidence = round(clampf(30 + ($pf['score']*50) + ($void_strength*10) + ($ocm['strength']/50), 0, 100),1);
+
+    // Persist EWMA + history + store match_case
+    ewma_update('master_voidscore', $void_strength);
+    ewma_update('pm_last_score', $pmmax['score']);
+
+    if ($pdo) {
+        $mk = md5($home.'|'.$away.'|'.($kickoff?:time()).microtime(true));
+        $analysis = [
+            'final_label'=>$final_label,
+            'true_prob'=>$true_prob,
+            'pmmax'=>$pmmax,
+            'smkx'=>$smkx,
+            'mem'=>mem_compute($tpo,$market_prob_norm),
+            'ocm'=>$ocm,
+            'ckp'=>$ckp,
+            'void'=>['strength'=>$void_strength,'div'=>$div,'trap'=>$trap],
+            'pf'=>$pf,
+            'mmm'=>$mmm_res,
+            'ghost'=>$ghost
+        ];
+        $ins = $pdo->prepare("INSERT INTO match_cases (match_key,kickoff_ts,league,payload,analysis,outcome,ts) VALUES(:mk,:ks,:league,:p,:a,:o,:t)");
+        $ins->execute([':mk'=>$mk,':ks'=>($kickoff?:0),':league'=>$league,':p'=>json_encode($payload,JSON_UNESCAPED_UNICODE),':a'=>json_encode($analysis,JSON_UNESCAPED_UNICODE),':o'=>'',':t'=>now_ts()]);
+    }
+
+    // Return integrated response
+    return [
+        'status'=>'ok',
+        'input'=>['home'=>$home,'away'=>$away,'league'=>$league,'kickoff_ts'=>$kickoff,'open1'=>$open1,'now1'=>$now1,'ah'=>$ah_list],
+        'metrics'=>[
+            'marketMomentum'=>$marketMomentum,'total1x2_mom'=>$total1x2_mom,'totalAH_mom'=>$totalAH_mom,'reboundSens'=>$reboundSens,
+            'pmmax'=>$pmmax,'smkx'=>$smkx,'mem'=>mem_compute($tpo,$market_prob_norm),'ocm'=>$ocm,'ckp'=>$ckp,'void'=>['strength'=>$void_strength,'div'=>$div,'trap'=>$trap],
+            'pf'=>$pf,'mmm'=>$mmm_res,'ghost'=>$ghost,'features_pf'=>$features_pf
+        ],
+        'final_label'=>$final_label,'recommendation'=>$recommendation,'predicted_winner'=>$predicted,'true_prob'=>$true_prob,'pf_score'=>$pf['score'],'pf_label'=>$pf['label'],'confidence'=>$confidence
+    ];
+}
+
+// ---------------- Mark Outcome (learn MMM + pattern_memory) ----------------
+if (php_sapi_name() !== 'cli') {
+    if (isset($_GET['action']) && $_GET['action']==='master_analyze' && $_SERVER['REQUEST_METHOD']==='POST') {
+        $raw = file_get_contents('php://input'); $payload = json_decode($raw,true);
+        if (!is_array($payload)) { header('Content-Type: application/json; charset=utf-8'); echo json_encode(['status'=>'error','msg'=>'invalid_payload','raw'=>substr($raw,0,200)], JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT); exit; }
+        $res = master_analyze($payload);
+        header('Content-Type: application/json; charset=utf-8'); echo json_encode($res, JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT); exit;
+    }
+    if (isset($_GET['action']) && $_GET['action']==='mark_outcome' && $_SERVER['REQUEST_METHOD']==='POST') {
+        $raw = file_get_contents('php://input'); $p = json_decode($raw,true);
+        if (!is_array($p) || empty($p['match_key']) || empty($p['outcome'])) { header('Content-Type: application/json; charset=utf-8'); echo json_encode(['status'=>'error','msg'=>'invalid']); exit; }
+        $mk = $p['match_key']; $o = $p['outcome']; $home = $p['home'] ?? null; $away=$p['away']??null;
+        if ($pdo) {
+            $st = $pdo->prepare("SELECT id,payload,analysis FROM match_cases WHERE match_key=:mk ORDER BY id DESC LIMIT 1");
+            $st->execute([':mk'=>$mk]); $r = $st->fetch(PDO::FETCH_ASSOC);
+            if ($r) {
+                // mark outcome in match_cases
+                $upd = $pdo->prepare("UPDATE match_cases SET outcome=:o WHERE id=:id"); $upd->execute([':o'=>$o,':id'=>$r['id']]);
+                // learn pattern_memory (existing insight)
+                $analysis = json_decode($r['analysis'],true);
+                $signature = ['analysis'=>$analysis];
+                $win = false;
+                if (isset($analysis['true_prob'])) {
+                    if ($o === 'home' && $analysis['true_prob']['home'] > $analysis['true_prob']['away']) $win=true;
+                    if ($o === 'away' && $analysis['true_prob']['away'] > $analysis['true_prob']['home']) $win=true;
+                }
+                // apply pm_learn pattern memory
+                // pm_learn uses pattern_memory table
+                // pattern signature is the analysis structure
+                pm_learn($signature, $win, ['match_case_id'=>$r['id']]);
+                // store MMM record
+                $payload = json_decode($r['payload'], true);
+                $features = [
+                    'decon'=>$analysis['pmmax']['decon'] ?? [],
+                    'bid'=>$analysis['pmmax']['bid'] ?? [],
+                    'true_prob'=>$analysis['true_prob'] ?? [],
+                    'ah_count'=>count($payload['ah'] ?? [])
+                ];
+                mmm_record($mk, $home ?? '', $away ?? '', $payload['open1'] ?? [], $payload['now1'] ?? [], $payload['ah'] ?? [], $features, $o);
+                // optionally autotune
+                $autot = [];
+                if (isset($CONFIG['autotune_enabled']) && $CONFIG['autotune_enabled']) $autot = ['ok'=>true];
+                header('Content-Type: application/json; charset=utf-8'); echo json_encode(['status'=>'ok','learned'=>$win,'autotune'=>$autot], JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT); exit;
+            }
+        }
+        header('Content-Type: application/json; charset=utf-8'); echo json_encode(['status'=>'error','msg'=>'not_found']); exit;
+    }
+
+    if (isset($_GET['action']) && $_GET['action']==='ewma_stats') {
+        header('Content-Type: application/json; charset=utf-8');
+        if (!$pdo) { echo json_encode(['status'=>'error','msg'=>'no_db']); exit; }
+        $st = $pdo->query("SELECT * FROM ewma_store");
+        $data = $st->fetchAll(PDO::FETCH_ASSOC);
+        echo json_encode(['status'=>'ok','ewma'=>$data], JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT); exit;
+    }
+
+    if (isset($_GET['action']) && $_GET['action']==='match_cases') {
+        header('Content-Type: application/json; charset=utf-8');
+        if (!$pdo) { echo json_encode(['status'=>'error','msg'=>'no_db']); exit; }
+        $st = $pdo->query("SELECT id,match_key,kickoff_ts,league,outcome,ts FROM match_cases ORDER BY id DESC LIMIT 200");
+        $data = $st->fetchAll(PDO::FETCH_ASSOC);
+        echo json_encode(['status'=>'ok','cases'=>$data], JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT); exit;
+    }
+}
+
+// ---------------- Minimal UI for quick test ----------------
+?><!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Last.php — PRE-MATCH MAX + MMM + GHOST + PF</title>
+<style>
+body{background:#07030a;color:#fff;font-family:Inter, 'Noto Sans Thai';padding:18px}
+.container{max-width:1100px;margin:0 auto}
+.card{background:linear-gradient(180deg,#0d0506,#241116);padding:12px;border-radius:12px;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+input,select,textarea{padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);background:rgba(255,255,255,0.02);color:#fff;width:100%}
+.btn{padding:10px 12px;border-radius:8px;background:linear-gradient(90deg,#7e2aa3,#d4a017);border:none;cursor:pointer}
+.small{color:#d9c89a}
+pre{white-space:pre-wrap}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="card"><h2 style="margin:0">PRE-MATCH MAX — FULL (MMM + Ghost + PF)</h2><div class="small">Integrated system — Ready to analyze</div></div>
+
+  <div class="card">
+    <div class="grid">
+      <div><label>Home</label><input id="home" placeholder="Team Home"></div>
+      <div><label>Away</label><input id="away" placeholder="Team Away"></div>
+      <div><label>League</label><input id="league" placeholder="EPL"></div>
+    </div>
+    <div style="height:8px"></div>
+    <div class="card">
+      <label>Kickoff (YYYY-MM-DD HH:MM)</label><input id="kickoff">
+      <div style="height:8px"></div>
+      <div class="small">1X2 Open</div>
+      <div class="grid"><input id="open_home" placeholder="2.10"><input id="open_draw" placeholder="3.40"><input id="open_away" placeholder="3.10"></div>
+      <div style="height:8px"></div>
+      <div class="small">1X2 Now</div>
+      <div class="grid"><input id="now_home" placeholder="1.95"><input id="now_draw" placeholder="3.60"><input id="now_away" placeholder="3.80"></div>
+    </div>
+
+    <div style="height:8px"></div>
+    <div style="text-align:right"><button id="analyzeBtn" class="btn">🔎 Analyze (All-In-One)</button></div>
+  </div>
+
+  <div id="result" class="card" style="display:none"></div>
+</div>
+
+<script>
+function toNum(v){ if(v===null||v==='') return NaN; return Number(String(v).replace(',','.')); }
+document.getElementById('analyzeBtn').addEventListener('click', async ()=>{
+  const payload = {
+    home: document.getElementById('home').value||'Home',
+    away: document.getElementById('away').value||'Away',
+    league: document.getElementById('league').value||'generic',
+    kickoff: document.getElementById('kickoff').value||'',
+    open1: {home: toNum(document.getElementById('open_home').value), draw: toNum(document.getElementById('open_draw')?.value), away: toNum(document.getElementById('open_away')?.value)},
+    now1: {home: toNum(document.getElementById('now_home').value), draw: toNum(document.getElementById('now_draw')?.value), away: toNum(document.getElementById('now_away')?.value)},
+    ah: [],
+    mode: 'pre_match'
+  };
+  document.getElementById('result').style.display='block';
+  document.getElementById('result').innerText='Analyzing...';
+  try {
+    const res = await fetch('?action=master_analyze', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const j = await res.json();
+    render(j);
+  } catch (e) { document.getElementById('result').innerText = 'Error: '+e.message; }
+});
+
+function render(r){
+  let html = `<div style="font-weight:900;color:#d4a017">${r.final_label}</div><div style="color:#d9c89a">Recommendation: ${r.recommendation}</div><div style="margin-top:6px">Predicted: ${r.predicted_winner} — Confidence: ${r.confidence}%</div><hr>`;
+  html += `<div style="display:flex;gap:12px;flex-wrap:wrap"><div style="flex:1;min-width:300px"><strong>True Prob</strong><pre>${JSON.stringify(r.true_prob, null, 2)}</pre></div><div style="flex:1;min-width:300px"><strong>PF</strong><pre>${JSON.stringify(r.pf_score, null, 2)} — ${r.pf_label}</pre></div></div>`;
+  html += `<div style="margin-top:8px"><strong>Metrics</strong><pre>${JSON.stringify(r.metrics, null, 2)}</pre></div>`;
+  document.getElementById('result').innerHTML = html;
+}
+</script>
+</body>
+</html>
